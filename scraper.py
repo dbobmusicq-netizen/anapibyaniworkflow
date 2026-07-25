@@ -5,9 +5,9 @@ import time
 import base64
 import logging
 import urllib.parse
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import xml.etree.ElementTree as ET
 from dateutil import parser as date_parser
 
 import requests
@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from supabase import create_client, Client
 
-# Configure Structured Enterprise Logging
+# Configure Structured Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [%(threadName)s] %(name)s: %(message)s",
@@ -23,13 +23,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AnimeEngine")
 
-# Credentials
+# Environment Variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PROXY_URL = os.environ.get("PROXY_URL")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    logger.critical("Database environment configurations (SUPABASE_URL/SUPABASE_KEY) are missing.")
+    logger.critical("Database environment variables (SUPABASE_URL / SUPABASE_KEY) are missing.")
     sys.exit(1)
 
 # Initialize Supabase Client
@@ -46,45 +46,39 @@ class ScraperException(Exception):
 
 
 class NetworkException(ScraperException):
-    """Exception raised when an index provider request fails repeatedly."""
+    """Raised when request pools encounter network failures."""
     pass
 
 
 class ParsingException(ScraperException):
-    """Exception raised when an index provider's payload structure changes."""
-    pass
-
-
-class DatabaseException(ScraperException):
-    """Exception raised when database transactions fail to process."""
+    """Raised when index parsing fail due to schema mutations."""
     pass
 
 
 class Normalizer:
-    """Utility class to parse and standardize complex metadata formats."""
+    """Helper class to parse and standardize complex metadata formats."""
 
     @staticmethod
     def info_hash(raw_hash):
         """
-        Normalizes any valid torrent info-hash representation to lowercase Hex.
+        Normalizes torrent hashes to lowercase Hex.
         Handles:
           - 40-character Hex (v1)
-          - 32-character Base32 (converts to 40-character Hex)
+          - 32-character Base32 (Converts to 40-character Hex)
           - 64-character Hex (v2 SHA-256)
         """
         if not raw_hash:
             return None
         h_str = raw_hash.strip().lower()
 
-        # Already standard 40-char hex or 64-char hex v2
+        # Check standard 40-character Hex or 64-character Hex
         if (len(h_str) == 40 and re.match(r'^[0-9a-f]{40}$', h_str)) or \
            (len(h_str) == 64 and re.match(r'^[0-9a-f]{64}$', h_str)):
             return h_str
 
-        # Convert Base32 (32 chars) to standard hex representation
+        # Convert Base32 representations
         if len(h_str) == 32 and re.match(r'^[a-z2-7]{32}$', h_str):
             try:
-                # Pad to 8-byte boundary if needed
                 missing_padding = len(h_str) % 8
                 padded = h_str
                 if missing_padding:
@@ -92,7 +86,7 @@ class Normalizer:
                 decoded = base64.b32decode(padded.upper().encode('ascii'))
                 return decoded.hex().lower()
             except Exception as e:
-                logger.debug(f"Failed to decode Base32 info-hash '{raw_hash}': {e}")
+                logger.debug(f"Failed to normalize Base32 hash '{raw_hash}': {e}")
         
         return h_str
 
@@ -131,20 +125,20 @@ class Normalizer:
         res_match = re.search(r'\b(2160p|1080p|720p|480p|360p|4k)\b', title, re.IGNORECASE)
         resolution = res_match.group(1).lower() if res_match else "Unknown"
         
-        # Audio Codec
+        # Audio formats
         audio_match = re.search(r'\b(FLAC|AAC|MP3|OPUS|DTS|DD\+?5\.1|AC3)\b', title, re.IGNORECASE)
         audio = audio_match.group(1).lower() if audio_match else "Unknown"
 
-        # Audio Channels
+        # Audio Channel Layout
         audio_channels = "2.0"
         if re.search(r'\b(5\.1|6ch|surround|multichannel)\b', title, re.IGNORECASE):
             audio_channels = "5.1"
 
-        # Video Codec
+        # Video Codecs
         codec_match = re.search(r'\b(x265|x264|h264|h265|hevc|av1)\b', title, re.IGNORECASE)
         codec = codec_match.group(1).lower() if codec_match else "Unknown"
         
-        # Content Classification Type (Episode vs Movie vs Batch Season Pack)
+        # Classification type: Movie, Season Batch, or Episode
         content_type = "episode"
         if re.search(r'\b(movie|film|theatrical|劇場版)\b', title, re.IGNORECASE):
             content_type = "movie"
@@ -188,19 +182,18 @@ class Normalizer:
 
 
 class BaseEngine:
-    """Base core for resilient fetching session initialization."""
     def __init__(self, source_name):
         self.source_name = source_name
         self.session = requests.Session()
         
-        # Configure exponential backoff on HTTP layer
+        # Configure connection pool with retries and exponential backoff
         retries = Retry(
             total=4,
             backoff_factor=1.5,
             status_forcelist=[429, 500, 502, 503, 504],
             raise_on_status=False
         )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=12, pool_maxsize=12)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
@@ -211,9 +204,9 @@ class BaseEngine:
         if PROXY_URL:
             self.session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
 
-    def fetch(self, url):
+    def fetch(self, url, timeout=25):
         try:
-            res = self.session.get(url, timeout=25)
+            res = self.session.get(url, timeout=timeout)
             res.raise_for_status()
             return res
         except Exception as e:
@@ -245,7 +238,6 @@ class NyaaEngine(BaseEngine):
         super().__init__("nyaa")
 
     def scrape(self):
-        # Category filter '1_2' narrows down items to English-translated Anime
         res = self.fetch("https://nyaa.si/?page=rss&c=1_2")
         torrents = []
         try:
@@ -305,7 +297,7 @@ class NyaaEngine(BaseEngine):
                     }
                 })
         except Exception as e:
-            raise ParsingException(f"XML parsing failed inside Nyaa feed parser: {e}")
+            raise ParsingException(f"XML Parsing failed inside Nyaa: {e}")
         return torrents
 
 
@@ -356,7 +348,7 @@ class AnimeToshoEngine(BaseEngine):
                     }
                 })
         except Exception as e:
-            raise ParsingException(f"JSON mapping failed inside AnimeTosho feed parser: {e}")
+            raise ParsingException(f"JSON parsing failed inside AnimeTosho: {e}")
         return torrents
 
 
@@ -408,7 +400,7 @@ class TokyoToshokanEngine(BaseEngine):
                     }
                 })
         except Exception as e:
-            raise ParsingException(f"XML parsing failed inside TokyoToshokan feed parser: {e}")
+            raise ParsingException(f"XML parsing failed inside TokyoToshokan: {e}")
         return torrents
 
 
@@ -456,7 +448,7 @@ class SubsPleaseEngine(BaseEngine):
                     }
                 })
         except Exception as e:
-            raise ParsingException(f"XML parsing failed inside SubsPlease feed parser: {e}")
+            raise ParsingException(f"XML parsing failed inside SubsPlease: {e}")
         return torrents
 
 
@@ -466,7 +458,6 @@ class EraiRawsEngine(BaseEngine):
 
     def scrape(self):
         try:
-            # Erai Raws official domain is often behind strict anti-bot mitigations.
             logger.info("Attempting direct RSS connection with Erai-Raws...")
             res = self.fetch("https://www.erai-raws.info/rss-page/")
             return self._parse_xml(res.content, source_tag="direct")
@@ -515,7 +506,6 @@ class EraiRawsEngine(BaseEngine):
         return torrents
 
     def scrape_via_nyaa_fallback(self):
-        # Query Nyaa specifically for verified Erai-raws team releases
         res = self.fetch("https://nyaa.si/?page=rss&q=Erai-raws")
         torrents = []
         try:
@@ -565,38 +555,32 @@ class EraiRawsEngine(BaseEngine):
                     }
                 })
         except Exception as e:
-            raise ParsingException(f"XML execution on Erai-Raws Nyaa fallback failed: {e}")
+            raise ParsingException(f"Erai-Raws Nyaa fallback parse failed: {e}")
         return torrents
 
 
 def persist_to_supabase_resilient(data_payload):
-    """
-    Handles batch database operations with exponential backoff on exceptions.
-    Fallbacks to itemized writes if the batch structure hits verification limits.
-    """
     if not data_payload:
-        logger.warning("No fresh data retrieved to commit to database.")
+        logger.warning("No data retrieved to synchronize.")
         return
 
-    # Locally de-duplicate before writing to database to prevent unnecessary transaction size
-    dedup_registry = {}
+    # De-duplicate dataset before starting SQL commits
+    dedup = {}
     for entry in data_payload:
         ih = entry["info_hash"]
-        if ih not in dedup_registry:
-            dedup_registry[ih] = entry
+        if ih not in dedup:
+            dedup[ih] = entry
         else:
-            # Prefer structural records containing defined size metrics
-            if dedup_registry[ih]["size_bytes"] is None and entry["size_bytes"] is not None:
-                dedup_registry[ih] = entry
+            if dedup[ih]["size_bytes"] is None and entry["size_bytes"] is not None:
+                dedup[ih] = entry
 
-    unique_list = list(dedup_registry.values())
+    unique_list = list(dedup.values())
     logger.info(f"Writing {len(unique_list)} validated records to Supabase...")
 
     chunk_size = 100
     for idx in range(0, len(unique_list), chunk_size):
         chunk = unique_list[idx:idx + chunk_size]
         
-        # Exponential backoff write retry logic
         success = False
         attempts = 3
         delay = 2.0
@@ -608,18 +592,17 @@ def persist_to_supabase_resilient(data_payload):
                     on_conflict="info_hash"
                 ).execute()
                 success = True
-                logger.info(f"Successfully processed database chunk [{idx // chunk_size + 1}]")
+                logger.info(f"Database sync chunk completed: [{idx // chunk_size + 1}]")
                 break
             except Exception as e:
                 logger.warning(f"Database batch transaction attempt {attempt + 1} failed: {e}")
                 if attempt < attempts - 1:
                     time.sleep(delay)
-                    delay *= 2.0  # double the delay time
+                    delay *= 2.0
                 else:
-                    logger.error("Database batch operations failed. Starting row-by-row fallback handler...")
+                    logger.error("Starting transactional fallback handler...")
 
         if not success:
-            # Itemized fallback to isolate corrupt/malformed items
             for item in chunk:
                 try:
                     supabase.table("anime_torrents").upsert(item, on_conflict="info_hash").execute()
@@ -642,7 +625,7 @@ def main():
     execution_results = []
     stats = {}
 
-    # Thread Pool Concurrency Pattern
+    # Thread Pool Concurrency Execution
     with ThreadPoolExecutor(max_workers=len(engines), thread_name_prefix="ScraperPool") as executor:
         future_to_engine = {executor.submit(engine.scrape): engine for engine in engines}
         
@@ -657,13 +640,11 @@ def main():
                 stats[engine.source_name] = {"status": "FAILED", "error": str(e), "records": 0}
                 logger.error(f"Engine [{engine.source_name}] crashed: {e}")
 
-    # Run Database Synchronization
     try:
         persist_to_supabase_resilient(execution_results)
     except Exception as e:
         logger.critical(f"Critical Database pipeline failure: {e}")
 
-    # Build Pipeline Health Summary
     total_duration = round(time.time() - start_time, 2)
     logger.info("==============================================")
     logger.info("           PIPELINE EXECUTION SUMMARY         ")
