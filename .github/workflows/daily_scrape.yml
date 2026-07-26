@@ -2,16 +2,26 @@ name: Production Anime Torrent Scraper
 
 on:
   schedule:
-    # Executes automatically once a day at 00:00 UTC
-    - cron: '0 0 * * *'
-  workflow_dispatch: # Retains the manual "Run workflow" trigger in the Actions tab
+    # Triggers automatically twice a day (Every 12 hours: 00:00 and 12:00 UTC)
+    - cron: '0 */12 * * *'
+  workflow_dispatch: # Interactive panel for manually triggered syncs or backfills
+    inputs:
+      historical_mode:
+        description: 'Run Historical Backfill Mode (true / false)'
+        required: false
+        default: 'false'
+      max_pages:
+        description: 'Historical page limit (each page holds 75 torrents)'
+        required: false
+        default: '30'
+      min_seeders:
+        description: 'Only store historical torrents with at least this many seeders'
+        required: false
+        default: '10'
 
-# Set explicit, minimal security permissions for the GitHub token
 permissions:
   contents: read
 
-# Prevent concurrent runs of the scraper from stepping on each other's toes
-# If a manual run is triggered while the scheduled run is active, the active run is preserved
 concurrency:
   group: anime-torrent-scraper
   cancel-in-progress: false
@@ -21,7 +31,7 @@ jobs:
     name: Execute Scraper Engine
     runs-on: ubuntu-latest
     
-    # Avoid stuck jobs wasting action minutes (the scraping run should take < 5 minutes)
+    # Prevents hung runs from consuming unnecessary action minutes
     timeout-minutes: 15
 
     steps:
@@ -30,11 +40,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Initialize Python 3.10 with Caching
+      - name: Initialize Python 3.10 with Dependency Caching
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip' # Leverages GitHub's native pip dependency caching
+          cache: 'pip'
           cache-dependency-path: 'requirements.txt'
 
       - name: Install Project Dependencies
@@ -48,18 +58,22 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-        # Redirect outputs to both the console and a diagnostics log file
+          # Map GitHub Actions inputs or fall back to default values for scheduled runs
+          HISTORICAL_MODE: ${{ github.event.inputs.historical_mode || 'false' }}
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '5' }}
+          MIN_SEEDERS: ${{ github.event.inputs.min_seeders || '10' }}
         run: |
           python scraper.py 2>&1 | tee scraper_execution.log
 
-      - name: Publish Step Summary
+      - name: Publish Step Summary to Action Dashboard
         if: always()
         run: |
           echo "### 🚀 Scraper Job Completed" >> $GITHUB_STEP_SUMMARY
           echo "This run completed with status: **${{ job.status }}**" >> $GITHUB_STEP_SUMMARY
+          echo "Execution mode: **Historical Mode: ${{ github.event.inputs.historical_mode || 'false' }}**" >> $GITHUB_STEP_SUMMARY
           echo "Execution timestamp: $(date -u)" >> $GITHUB_STEP_SUMMARY
           
-          # Extract the final stats table from the logs if it exists and append it to the step summary UI
+          # Extracts print summary from log files and appends it to the workflow overview
           if grep -q "PIPELINE EXECUTION SUMMARY" scraper_execution.log; then
             echo "#### 📊 Pipeline Metrics" >> $GITHUB_STEP_SUMMARY
             echo "\`\`\`text" >> $GITHUB_STEP_SUMMARY
@@ -73,4 +87,4 @@ jobs:
         with:
           name: scraper-execution-failure-logs
           path: scraper_execution.log
-          retention-days: 7 # Kept for a short period to save space on your GitHub quota
+          retention-days: 7
