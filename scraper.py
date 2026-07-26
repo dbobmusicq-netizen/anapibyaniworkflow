@@ -6,7 +6,7 @@ import base64
 import logging
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as date_parser
 
@@ -27,6 +27,15 @@ logger = logging.getLogger("AnimeEngine")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 PROXY_URL = os.environ.get("PROXY_URL")
+
+# Auto-clean SUPABASE_URL to prevent PGRST125 malformed endpoint paths
+if SUPABASE_URL:
+    SUPABASE_URL = SUPABASE_URL.split("/rest/v1")[0].rstrip("/")
+
+# Backfill controls mapped from GitHub Action inputs
+HISTORICAL_MODE = os.environ.get("HISTORICAL_MODE", "false").lower() == "true"
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "10"))
+MIN_SEEDERS = int(os.environ.get("MIN_SEEDERS", "10"))
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     logger.critical("Database environment variables (SUPABASE_URL / SUPABASE_KEY) are missing.")
@@ -51,7 +60,7 @@ class NetworkException(ScraperException):
 
 
 class ParsingException(ScraperException):
-    """Raised when index parsing fail due to schema mutations."""
+    """Raised when index parsing fails due to schema mutations."""
     pass
 
 
@@ -60,23 +69,14 @@ class Normalizer:
 
     @staticmethod
     def info_hash(raw_hash):
-        """
-        Normalizes torrent hashes to lowercase Hex.
-        Handles:
-          - 40-character Hex (v1)
-          - 32-character Base32 (Converts to 40-character Hex)
-          - 64-character Hex (v2 SHA-256)
-        """
         if not raw_hash:
             return None
         h_str = raw_hash.strip().lower()
 
-        # Check standard 40-character Hex or 64-character Hex
         if (len(h_str) == 40 and re.match(r'^[0-9a-f]{40}$', h_str)) or \
            (len(h_str) == 64 and re.match(r'^[0-9a-f]{64}$', h_str)):
             return h_str
 
-        # Convert Base32 representations
         if len(h_str) == 32 and re.match(r'^[a-z2-7]{32}$', h_str):
             try:
                 missing_padding = len(h_str) % 8
@@ -111,9 +111,22 @@ class Normalizer:
         return int(val)
 
     @staticmethod
+    def is_fresh_release(pub_date_str):
+        """Checks if a torrent was published within the last 24 hours."""
+        if not pub_date_str:
+            return True  # Save by default if age cannot be verified
+        try:
+            pub_date = date_parser.parse(pub_date_str)
+            now = datetime.now(timezone.utc)
+            if pub_date.tzinfo is None:
+                pub_date = pub_date.replace(tzinfo=timezone.utc)
+            delta = now - pub_date
+            return delta.total_seconds() < 86400  # 24 hours
+        except Exception:
+            return True
+
+    @staticmethod
     def title_metadata(title):
-        """Analyzes and tokenizes title configurations."""
-        # Release Group
         group_match = re.match(r'^\[(.*?)\]', title)
         group = group_match.group(1).strip() if group_match else "Unknown"
         
@@ -121,38 +134,31 @@ class Normalizer:
         if group_match:
             cleaned_title = cleaned_title[group_match.end():].strip()
             
-        # Resolution/Quality
         res_match = re.search(r'\b(2160p|1080p|720p|480p|360p|4k)\b', title, re.IGNORECASE)
         resolution = res_match.group(1).lower() if res_match else "Unknown"
         
-        # Audio formats
         audio_match = re.search(r'\b(FLAC|AAC|MP3|OPUS|DTS|DD\+?5\.1|AC3)\b', title, re.IGNORECASE)
         audio = audio_match.group(1).lower() if audio_match else "Unknown"
 
-        # Audio Channel Layout
         audio_channels = "2.0"
         if re.search(r'\b(5\.1|6ch|surround|multichannel)\b', title, re.IGNORECASE):
             audio_channels = "5.1"
 
-        # Video Codecs
         codec_match = re.search(r'\b(x265|x264|h264|h265|hevc|av1)\b', title, re.IGNORECASE)
         codec = codec_match.group(1).lower() if codec_match else "Unknown"
         
-        # Classification type: Movie, Season Batch, or Episode
         content_type = "episode"
         if re.search(r'\b(movie|film|theatrical|劇場版)\b', title, re.IGNORECASE):
             content_type = "movie"
         elif re.search(r'\b(batch|complete|01\s*-\s*\d+|pack|season\s*\d+|s\d+\s*-\s*s\d+)\b', title, re.IGNORECASE):
             content_type = "batch"
 
-        # Subtitle properties
         subs = "English"
         if re.search(r'\b(multi-sub|multisubs|multi|esp|ger|fre)\b', title, re.IGNORECASE):
             subs = "Multi-Sub"
         elif re.search(r'\b(raw|unsubbed)\b', title, re.IGNORECASE):
             subs = "Raw"
         
-        # Episode extraction
         episode = "Unknown"
         ep_patterns = [
             r'\sS(\d+)E(\d+)\b',
@@ -182,11 +188,12 @@ class Normalizer:
 
 
 class BaseEngine:
-    def __init__(self, source_name):
+    def __init__(self, source_name, proxy_pool=None):
         self.source_name = source_name
         self.session = requests.Session()
+        self.proxy_pool = proxy_pool or []
+        self.current_proxy_idx = 0
         
-        # Configure connection pool with retries and exponential backoff
         retries = Retry(
             total=4,
             backoff_factor=1.5,
@@ -201,16 +208,42 @@ class BaseEngine:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         })
 
+    def fetch(self, url, timeout=15):
+        # Prioritize custom user proxy if defined
         if PROXY_URL:
-            self.session.proxies = {"http": PROXY_URL, "https": PROXY_URL}
+            try:
+                res = self.session.get(url, proxies={"http": PROXY_URL, "https": PROXY_URL}, timeout=timeout)
+                res.raise_for_status()
+                return res
+            except Exception as e:
+                raise NetworkException(f"Custom user proxy failed: {e}")
 
-    def fetch(self, url, timeout=25):
+        # Fallback to rotating through parsed public proxies
+        attempts = max(3, len(self.proxy_pool)) if self.proxy_pool else 1
+        for attempt in range(attempts):
+            current_proxies = None
+            if self.proxy_pool:
+                p = self.proxy_pool[self.current_proxy_idx % len(self.proxy_pool)]
+                current_proxies = {"http": f"http://{p}", "https": f"http://{p}"}
+                self.current_proxy_idx += 1
+            
+            try:
+                res = self.session.get(url, proxies=current_proxies, timeout=timeout)
+                res.raise_for_status()
+                return res
+            except Exception as e:
+                if not self.proxy_pool:
+                    raise NetworkException(f"Direct connection failed: {e}")
+                logger.debug(f"[{self.source_name}] Proxy failed. Trying next node... Error: {e}")
+        
+        # Last-resort fallback to direct connection
         try:
+            logger.debug(f"[{self.source_name}] Proxy pool exhausted. Attempting direct fallback connection...")
             res = self.session.get(url, timeout=timeout)
             res.raise_for_status()
             return res
         except Exception as e:
-            raise NetworkException(f"Network processing failed for [{self.source_name}] at URL {url}: {e}")
+            raise NetworkException(f"Rotating proxy pool exhausted and direct connection failed: {e}")
 
     @staticmethod
     def extract_hash_from_magnet(magnet_uri):
@@ -234,14 +267,17 @@ class BaseEngine:
 
 
 class NyaaEngine(BaseEngine):
-    def __init__(self):
-        super().__init__("nyaa")
+    def __init__(self, proxy_pool=None):
+        super().__init__("nyaa", proxy_pool)
 
     def scrape(self):
         res = self.fetch("https://nyaa.si/?page=rss&c=1_2")
+        return self.parse_xml(res.content)
+
+    def parse_xml(self, content):
         torrents = []
         try:
-            root = ET.fromstring(res.content)
+            root = ET.fromstring(content)
             for item in root.findall('.//item'):
                 title = item.find('title').text
                 
@@ -270,6 +306,11 @@ class NyaaEngine(BaseEngine):
                 
                 pub_date_str = item.find('pubDate').text
                 published_at = date_parser.parse(pub_date_str).isoformat()
+                
+                # Filter out old files with low seed counts
+                if not Normalizer.is_fresh_release(pub_date_str) and seeders < MIN_SEEDERS:
+                    continue
+
                 meta = Normalizer.title_metadata(title)
 
                 torrents.append({
@@ -301,9 +342,54 @@ class NyaaEngine(BaseEngine):
         return torrents
 
 
+class NyaaHistoricalEngine(NyaaEngine):
+    def __init__(self, max_pages=10, min_seeders=10, proxy_pool=None):
+        super().__init__(proxy_pool)
+        self.source_name = "nyaa_historical"
+        self.max_pages = max_pages
+        self.min_seeders = min_seeders
+
+    def scrape(self):
+        logger.info(f"Starting historical backfill (Pages: 1 to {self.max_pages}, Min Seeders: {self.min_seeders})")
+        historical_torrents = []
+
+        for page in range(1, self.max_pages + 1):
+            logger.info(f"Scraping Nyaa page {page} of {self.max_pages} (Sorted by Seeders DESC)...")
+            url = f"https://nyaa.si/?page=rss&c=1_2&s=seeders&o=desc&p={page}"
+            
+            try:
+                res = self.fetch(url)
+                if not res or not res.content.strip():
+                    break
+
+                page_results = self.parse_xml(res.content)
+                if not page_results:
+                    break
+
+                first_seeds = page_results[0].get("seeders", 0)
+                last_seeds = page_results[-1].get("seeders", 0)
+                logger.info(f"Page {page} complete. Seeder bounds: {first_seeds} -> {last_seeds}")
+
+                # Save if seeders are above target limit
+                filtered_results = [t for t in page_results if t.get("seeders", 0) >= self.min_seeders]
+                historical_torrents.extend(filtered_results)
+
+                if last_seeds < self.min_seeders:
+                    logger.info(f"Seeders dropped below target limit ({self.min_seeders}). Halting.")
+                    break
+
+                time.sleep(2.0)
+
+            except Exception as e:
+                logger.error(f"Error occurred during historical backfill execution on page {page}: {e}")
+                break
+
+        return historical_torrents
+
+
 class AnimeToshoEngine(BaseEngine):
-    def __init__(self):
-        super().__init__("animetosho")
+    def __init__(self, proxy_pool=None):
+        super().__init__("animetosho", proxy_pool)
 
     def scrape(self):
         res = self.fetch("https://feed.animetosho.org/json")
@@ -353,8 +439,8 @@ class AnimeToshoEngine(BaseEngine):
 
 
 class TokyoToshokanEngine(BaseEngine):
-    def __init__(self):
-        super().__init__("tokyotosho")
+    def __init__(self, proxy_pool=None):
+        super().__init__("tokyotosho", proxy_pool)
 
     def scrape(self):
         res = self.fetch("https://www.tokyotosho.info/rss.php")
@@ -405,14 +491,24 @@ class TokyoToshokanEngine(BaseEngine):
 
 
 class SubsPleaseEngine(BaseEngine):
-    def __init__(self):
-        super().__init__("subsplease")
+    def __init__(self, proxy_pool=None):
+        super().__init__("subsplease", proxy_pool)
 
     def scrape(self):
-        res = self.fetch("https://subsplease.org/rss/?r=1080p")
+        logger.info("Parsing SubsPlease RSS feed...")
+        response = self.fetch("https://subsplease.org/rss/?r=1080p")
+        
+        if not response or not response.content.strip():
+            logger.warning("SubsPlease 1080p feed returned empty. Falling back to main RSS feed...")
+            response = self.fetch("https://subsplease.org/rss/")
+            
+        if not response or not response.content.strip():
+            logger.error("SubsPlease main feed returned empty. Skipping this run.")
+            return []
+
         torrents = []
         try:
-            root = ET.fromstring(res.content)
+            root = ET.fromstring(response.content)
             for item in root.findall('.//item'):
                 title = item.find('title').text
                 magnet = self.find_magnet_in_xml_item(item)
@@ -433,7 +529,7 @@ class SubsPleaseEngine(BaseEngine):
                     "info_hash": info_hash,
                     "size_bytes": None,
                     "size_text": None,
-                    "resolution": "1080p",
+                    "resolution": meta["resolution"] if meta["resolution"] != "Unknown" else "1080p",
                     "release_group": "SubsPlease",
                     "codec": meta["codec"],
                     "audio": meta["audio"],
@@ -453,8 +549,8 @@ class SubsPleaseEngine(BaseEngine):
 
 
 class EraiRawsEngine(BaseEngine):
-    def __init__(self):
-        super().__init__("erai-raws")
+    def __init__(self, proxy_pool=None):
+        super().__init__("erai-raws", proxy_pool)
 
     def scrape(self):
         try:
@@ -559,12 +655,26 @@ class EraiRawsEngine(BaseEngine):
         return torrents
 
 
+def fetch_public_proxies():
+    """Fetches plain-text public HTTP proxies to bypass server limits."""
+    logger.info("Loading public proxy list for scraper pool...")
+    url = "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all"
+    try:
+        res = requests.get(url, timeout=15)
+        if res.status_code == 200:
+            proxies = [p.strip() for p in res.text.split("\n") if p.strip()]
+            logger.info(f"Loaded {len(proxies)} rotating proxies.")
+            return proxies
+    except Exception as e:
+        logger.warning(f"Could not load public proxies: {e}. Executing with direct connections.")
+    return []
+
+
 def persist_to_supabase_resilient(data_payload):
     if not data_payload:
         logger.warning("No data retrieved to synchronize.")
         return
 
-    # De-duplicate dataset before starting SQL commits
     dedup = {}
     for entry in data_payload:
         ih = entry["info_hash"]
@@ -612,20 +722,29 @@ def persist_to_supabase_resilient(data_payload):
 
 def main():
     start_time = time.time()
-    logger.info("Initializing multi-index scraping run...")
+    
+    # Retrieve dynamic rolling proxies
+    proxy_pool = fetch_public_proxies() if not PROXY_URL else []
 
-    engines = [
-        NyaaEngine(),
-        AnimeToshoEngine(),
-        TokyoToshokanEngine(),
-        SubsPleaseEngine(),
-        EraiRawsEngine()
-    ]
+    # Assemble engines
+    if HISTORICAL_MODE:
+        logger.info(f"DUAL-MODE TRIGGER: Starting historical backfill indexing...")
+        engines = [NyaaHistoricalEngine(max_pages=MAX_PAGES, min_seeders=MIN_SEEDERS, proxy_pool=proxy_pool)]
+    else:
+        logger.info("DUAL-MODE TRIGGER: Starting automatic daily stream...")
+        # Running both standard real-time feed extraction + 5-page historical update run on every execution!
+        engines = [
+            NyaaEngine(proxy_pool=proxy_pool),
+            AnimeToshoEngine(proxy_pool=proxy_pool),
+            TokyoToshokanEngine(proxy_pool=proxy_pool),
+            SubsPleaseEngine(proxy_pool=proxy_pool),
+            EraiRawsEngine(proxy_pool=proxy_pool),
+            NyaaHistoricalEngine(max_pages=5, min_seeders=MIN_SEEDERS, proxy_pool=proxy_pool) # Sweep 5 most popular pages to refresh peers
+        ]
 
     execution_results = []
     stats = {}
 
-    # Thread Pool Concurrency Execution
     with ThreadPoolExecutor(max_workers=len(engines), thread_name_prefix="ScraperPool") as executor:
         future_to_engine = {executor.submit(engine.scrape): engine for engine in engines}
         
